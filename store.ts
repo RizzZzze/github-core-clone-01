@@ -20,6 +20,14 @@ export interface RepoInput {
   defaultBranch: string;
 }
 
+export interface CommitMeta {
+  sha: string;
+  treeSha: string;
+  parents: string[];
+  message: string;
+  seq: number;
+}
+
 export interface RepoRecord {
   id: number;
   name: string;
@@ -28,6 +36,13 @@ export interface RepoRecord {
   isPrivate: boolean;
   defaultBranch: string;
   seq: number;
+  /** Content-addressed objects: sha -> "<type> <len>\0<payload>" bytes. */
+  objects: Map<string, Buffer>;
+  /** Full ref name ('refs/heads/main') -> commit sha. */
+  refs: Map<string, string>;
+  /** Commits by sha, in creation order for listing. */
+  commits: Map<string, CommitMeta>;
+  commitSeq: number;
 }
 
 export class RepoStore {
@@ -45,6 +60,10 @@ export class RepoStore {
       isPrivate: input.isPrivate,
       defaultBranch: input.defaultBranch,
       seq: this.#nextSeq++,
+      objects: new Map(),
+      refs: new Map(),
+      commits: new Map(),
+      commitSeq: 0,
     };
     this.#byName.set(input.name, rec);
     return rec;
