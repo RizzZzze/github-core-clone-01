@@ -1,47 +1,25 @@
 # github-core-clone-01
 
-A standalone GitHub-compatible git forge in one Node process: git smart HTTP,
-REST v3, GraphQL and MCP over its own in-memory store. No dependencies, no git
-binary, no outside service.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/RizzZzze/github-core-clone-01/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/RizzZzze/github-core-clone-01/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-## Run
+A GitHub-compatible git forge in dependency-free Node.js: git smart HTTP (protocol v0/v2, shallow clones, delta packs), REST v3, GraphQL and MCP over one in-memory store.
+
+## Run it
 
 ```sh
 node --experimental-strip-types main.ts
 ```
 
-`MAKEFUN_ENV_URL` must point at the harness environment. The process binds an
-ephemeral port, registers it, long-polls `/done`, and exits 0 when told.
+---
 
-## Layout
+<sub>Entered on [make.fun](https://make.fun/?ref=e054nszg&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
 
-- `main.ts` — lifecycle: bind, register, poll done, exit.
-- `app.ts` — HTTP server and every route.
-- `store.ts` — in-memory repo store (repos, objects, refs, commits).
-- `gitobj.ts` — git object layer: SHA-1 blobs, trees and commits, deterministic.
-- `gitpkt.ts` — pkt-line framing and ref advertisements.
+## What it does
 
-## Status
-
-- Milestone 1: lifecycle, healthz, API root, repo store, REST repos, git info/refs.
-- Milestone 2: contents (PUT/GET/DELETE), branches, commits, git refs — one shared
-  object store, one commit history per branch, fixed author and timestamp so the
-  same requests always mint the same shas.
-- Milestone 3: git pack POST — receive-pack (push, fast-forward only, per-ref
-  report-status) and upload-pack (v2 ls-refs/fetch and v0 fetch, shallow and
-  deepen, side-band-64k packs). Packfiles are read with full ofs/ref delta
-  resolution and written delta-free; pushed commits are visible to the REST
-  layer through the same store. Verified with a real git client (push, clone,
-  byte-identical files and shas) as well as the kit suite: git 30/30.
-- Milestone 4: labels, issues (+ comments) and pull requests (+ merge) over the
-  same store. Merge is a real two-parent merge commit from a three-way file
-  merge — clean when only one side changed a path, 405 on a genuine conflict —
-  and the base branch advances to it. Kit suite: issues 15/15, pulls 20/20,
-  protocol 5/5.
-- Milestone 5: GraphQL v4 at POST /api/graphql (a dependency-free parser and
-  executor: viewer, repository with issues/pullRequests and cursor pagination,
-  node(id:), __type introspection, all five mutations, operation batching) and
-  MCP at POST /mcp (JSON-RPC 2.0, server/discover for the 2026-07-28 era plus
-  the legacy initialize handshake, six tools over the same store). The merge
-  implementation is shared by REST, GraphQL and MCP, so the three surfaces
-  can never disagree. Kit suite: 120/120, feature 600, agent 200.
+- Git smart HTTP at `/{owner}/{repo}.git`: upload-pack v2 (ls-refs, fetch, shallow, filter) and v0, receive-pack v0 with fast-forward-only ref updates and per-ref report-status.
+- REST v3 under `/api/v3`: repositories, branches, commits, contents, labels, issues and comments, pull requests with real two-parent merge commits.
+- GraphQL at `/api/graphql`: viewer, repository, issues and pull requests with connections, pagination and mutations.
+- MCP at `/mcp`: JSON-RPC with `server/discover`, `initialize`, and six tools (`create_repo`, `get_repo`, `create_issue`, `list_issues`, `create_pull_request`, `merge_pull_request`).
+- One process, one in-memory store shared by every protocol; no dependencies, Node.js standard library only.
