@@ -6,7 +6,13 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { RepoStore, VIEWER_LOGIN, repoJson, type CommitMeta, type RepoRecord } from './store.ts';
-import { advertiseV0ReceivePack, advertiseV0UploadPack, advertiseV2UploadPack } from './gitpkt.ts';
+import {
+  advertiseV0ReceivePack,
+  advertiseV0UploadPack,
+  advertiseV2UploadPack,
+  pktLine,
+  type AdvertisedRef,
+} from './gitpkt.ts';
 import {
   FIXED_AUTHOR_EMAIL,
   FIXED_AUTHOR_NAME,
@@ -16,14 +22,36 @@ import {
   buildTreesForFiles,
   filesOfTree,
   objectBytes,
+  parseCommit,
   parseTree,
   splitObject,
 } from './gitobj.ts';
+import {
+  ZERO_OID,
+  collectReachable,
+  parseTag,
+  planFetch,
+  readPack,
+  writePack,
+  type StoredObject,
+} from './pack.ts';
+import {
+  buildPushReport,
+  buildV2LsRefs,
+  parseReceivePack,
+  parseV0Fetch,
+  parseV2Request,
+  sideband,
+  v2Section,
+} from './gitproto.ts';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_GIT_BODY_BYTES = 64 * 1024 * 1024;
 const JSON_BODY = 'application/json; charset=utf-8';
 const UPLOAD_AD = 'application/x-git-upload-pack-advertisement';
 const RECEIVE_AD = 'application/x-git-receive-pack-advertisement';
+const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
+const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
 /** The token the trial hands the process; every API call must present it. */
 function expectedToken(): string {
@@ -66,8 +94,8 @@ function queryOf(req: IncomingMessage): URLSearchParams {
   }
 }
 
-/** Read a request body, capped; null when it overruns the cap. */
-function readBody(req: IncomingMessage): Promise<Buffer | null> {
+/** Read a request body, capped; null when it overruns the cap. Git pushes carry packfiles, so they get a bigger cap. */
+function readBody(req: IncomingMessage, maxBytes: number = MAX_BODY_BYTES): Promise<Buffer | null> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -79,7 +107,7 @@ function readBody(req: IncomingMessage): Promise<Buffer | null> {
     };
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
+      if (size > maxBytes) {
         finish(null);
         return;
       }
@@ -187,6 +215,70 @@ export function createApp(): Server {
     if (byBranch !== undefined) return byBranch;
     if (/^[0-9a-f]{40}$/.test(ref) && rec.commits.has(ref)) return ref;
     return null;
+  };
+
+  /** The object at `sha` in a repo, split into type + payload, or undefined. */
+  const objectOf = (rec: RepoRecord, sha: string): StoredObject | undefined => {
+    const bytes = rec.objects.get(sha);
+    if (bytes === undefined) return undefined;
+    const split = splitObject(bytes);
+    if (split === null) return undefined;
+    return { type: split.type, data: split.payload };
+  };
+
+  /** All refs of a repo, sorted by name, with annotated tags peeled to their commit. */
+  const refList = (rec: RepoRecord): AdvertisedRef[] => {
+    return [...rec.refs.entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([name, oid]) => {
+        const entry: AdvertisedRef = { oid, name };
+        const object = objectOf(rec, oid);
+        if (object !== undefined && object.type === 'tag') {
+          const tag = parseTag(object.data);
+          if (tag !== null) entry.peeled = tag.object;
+        }
+        return entry;
+      });
+  };
+
+  /** Register every commit reachable from `tips` that the REST layer has not seen yet (pushed commits). */
+  const registerCommits = (rec: RepoRecord, tips: readonly string[]): void => {
+    const reach = collectReachable(tips, (oid) => objectOf(rec, oid));
+    for (const sha of reach.objects) {
+      if (rec.commits.has(sha)) continue;
+      const object = objectOf(rec, sha);
+      if (object === undefined || object.type !== 'commit') continue;
+      const parsed = parseCommit(object.data);
+      if (parsed === null) continue;
+      rec.commits.set(sha, {
+        sha,
+        treeSha: parsed.treeSha,
+        parents: parsed.parents,
+        message: parsed.message,
+        seq: rec.commitSeq++,
+      });
+    }
+  };
+
+  /** True when `ancestor` is reachable from `descendant` through commit parents (merge parents included). */
+  const isAncestor = (rec: RepoRecord, ancestor: string, descendant: string): boolean => {
+    if (ancestor === descendant) return true;
+    const seen = new Set<string>();
+    const queue = [descendant];
+    while (queue.length) {
+      const cur = queue.shift() as string;
+      if (seen.has(cur)) continue;
+      seen.add(cur);
+      const object = objectOf(rec, cur);
+      if (object === undefined || object.type !== 'commit') continue;
+      const parsed = parseCommit(object.data);
+      if (parsed === null) continue;
+      for (const parent of parsed.parents) {
+        if (parent === ancestor) return true;
+        queue.push(parent);
+      }
+    }
+    return false;
   };
 
   /** The commit object GitHub returns for one commit. */
@@ -807,6 +899,197 @@ export function createApp(): Server {
         return;
       }
 
+      // Git smart HTTP: POST /{owner}/{repo}.git/git-upload-pack and git-receive-pack.
+      if (seg.length === 3 && seg[1].endsWith('.git') && (seg[2] === 'git-upload-pack' || seg[2] === 'git-receive-pack')) {
+        if (method !== 'POST') {
+          notFound(res);
+          return;
+        }
+        if (!authed(req)) {
+          unauthorised(res);
+          return;
+        }
+        const owner = seg[0] ?? '';
+        const repoName = seg[1].slice(0, -'.git'.length);
+        const rec = loadRepo(res, owner, repoName);
+        if (rec === null) return;
+        const raw = await readBody(req, MAX_GIT_BODY_BYTES);
+        if (raw === null) {
+          sendJson(res, 400, { message: 'Body too large' });
+          return;
+        }
+        const lookup = (oid: string): StoredObject | undefined => objectOf(rec, oid);
+        try {
+          if (seg[2] === 'git-upload-pack') {
+            if ((req.headers['git-protocol'] ?? '') === 'version=2') {
+              const { command, args } = parseV2Request(raw);
+              if (command === 'ls-refs') {
+                const prefixes: string[] = [];
+                for (const arg of args) {
+                  const line = arg.replace(/\n$/, '');
+                  if (line.startsWith('ref-prefix ')) prefixes.push(line.slice(11));
+                }
+                const keep = (name: string): boolean =>
+                  prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
+                const lines: Array<{ oid: string; name: string; peeled?: string; symrefTarget?: string }> = [];
+                const headTarget = `refs/heads/${rec.defaultBranch}`;
+                const headTip = rec.refs.get(headTarget);
+                if (headTip !== undefined && keep('HEAD')) {
+                  lines.push({ oid: headTip, name: 'HEAD', symrefTarget: headTarget });
+                }
+                for (const ref of refList(rec)) {
+                  if (!keep(ref.name)) continue;
+                  lines.push({ oid: ref.oid, name: ref.name, peeled: ref.peeled });
+                }
+                sendRaw(res, 200, buildV2LsRefs(lines), UPLOAD_RESULT);
+                return;
+              }
+              if (command === 'fetch') {
+                const wants: string[] = [];
+                const haves: string[] = [];
+                const shallow: string[] = [];
+                let deepen: number | undefined;
+                for (const arg of args) {
+                  const line = arg.replace(/\n$/, '');
+                  if (line.startsWith('want ')) wants.push(line.slice(5));
+                  else if (line.startsWith('have ')) haves.push(line.slice(5));
+                  else if (line.startsWith('shallow ')) shallow.push(line.slice(8));
+                  else if (line.startsWith('deepen ')) {
+                    const n = Number.parseInt(line.slice(7), 10);
+                    if (Number.isFinite(n)) deepen = n;
+                  }
+                }
+                if (wants.length === 0) {
+                  sendJson(res, 400, { message: 'Fetch needs at least one want' });
+                  return;
+                }
+                for (const want of wants) {
+                  const object = lookup(want);
+                  if (object === undefined || (object.type !== 'commit' && object.type !== 'tag')) {
+                    sendJson(res, 400, { message: 'Object not found' });
+                    return;
+                  }
+                }
+                const plan = planFetch(lookup, wants, haves, deepen, shallow);
+                const parts: Buffer[] = [];
+                // Real git expects an acknowledgments section only when the
+                // fetch negotiated haves; a fresh clone (no haves) goes straight
+                // to the packfile section, and an unsolicited 'acknowledgments'
+                // header is a protocol error to it.
+                if (haves.length > 0) {
+                  const common = haves.filter((have) => lookup(have) !== undefined);
+                  const ackLines =
+                    common.length > 0 ? [...common.map((have) => `ACK ${have}`), 'ready'] : ['NAK'];
+                  parts.push(v2Section('acknowledgments', ackLines));
+                }
+                const shallowLines = [
+                  ...plan.shallow.map((sha) => `shallow ${sha}`),
+                  ...plan.unshallow.map((sha) => `unshallow ${sha}`),
+                ];
+                if (shallowLines.length) parts.push(v2Section('shallow-info', shallowLines));
+                // The packfile section is one header line, then the side-band
+                // packets, then a flush — no flush may sit between the header
+                // and the packets, or the section ends before the pack starts.
+                parts.push(pktLine('packfile\n'));
+                parts.push(sideband(writePack(plan.send), 1));
+                sendRaw(res, 200, Buffer.concat(parts), UPLOAD_RESULT);
+                return;
+              }
+              sendJson(res, 400, { message: 'Unknown v2 command' });
+              return;
+            }
+            const fetch0 = parseV0Fetch(raw);
+            for (const want of fetch0.wants) {
+              const object = lookup(want);
+              if (object === undefined || (object.type !== 'commit' && object.type !== 'tag')) {
+                sendJson(res, 400, { message: 'Object not found' });
+                return;
+              }
+            }
+            const plan0 = planFetch(lookup, fetch0.wants, fetch0.haves, fetch0.deepen, fetch0.shallow);
+            const parts0: Buffer[] = [];
+            const common0 = fetch0.haves.filter((have) => lookup(have) !== undefined);
+            if (common0.length === 0) {
+              parts0.push(pktLine('NAK\n'));
+            } else {
+              common0.forEach((have, index) => {
+                parts0.push(pktLine(index < common0.length - 1 ? `ACK ${have} continue\n` : `ACK ${have}\n`));
+              });
+            }
+            for (const sha of plan0.shallow) parts0.push(pktLine(`shallow ${sha}\n`));
+            for (const sha of plan0.unshallow) parts0.push(pktLine(`unshallow ${sha}\n`));
+            parts0.push(sideband(writePack(plan0.send), 1));
+            sendRaw(res, 200, Buffer.concat(parts0), UPLOAD_RESULT);
+            return;
+          }
+          // git-receive-pack: parse the pack first; a corrupt pack stores nothing.
+          const { commands, pack } = parseReceivePack(raw);
+          let unpackOk = true;
+          let unpackDetail = 'ok';
+          let incoming: Map<string, StoredObject> = new Map();
+          if (pack.length > 0) {
+            try {
+              incoming = readPack(pack, lookup);
+            } catch {
+              unpackOk = false;
+              unpackDetail = 'error';
+            }
+          }
+          const report: Array<{ ref: string; ok: boolean; reason: string }> = [];
+          if (unpackOk) {
+            for (const [sha, object] of incoming) {
+              if (!rec.objects.has(sha)) rec.objects.set(sha, objectBytes(object.type, object.data));
+            }
+            const advanced: string[] = [];
+            for (const cmd of commands) {
+              const validRef = /^refs\/[A-Za-z0-9._/-]+$/.test(cmd.ref) && !cmd.ref.includes('..') && !cmd.ref.includes('//');
+              const current = rec.refs.get(cmd.ref);
+              if (!validRef) {
+                report.push({ ref: cmd.ref, ok: false, reason: 'invalid refname' });
+                continue;
+              }
+              if (cmd.newOid === ZERO_OID) {
+                if (current === undefined) {
+                  report.push({ ref: cmd.ref, ok: false, reason: 'remote ref does not exist' });
+                } else if (current !== cmd.oldOid) {
+                  report.push({ ref: cmd.ref, ok: false, reason: 'old value does not match' });
+                } else {
+                  rec.refs.delete(cmd.ref);
+                  report.push({ ref: cmd.ref, ok: true, reason: '' });
+                }
+                continue;
+              }
+              const target = lookup(cmd.newOid);
+              if (current !== undefined && current !== cmd.oldOid) {
+                report.push({ ref: cmd.ref, ok: false, reason: 'old value does not match' });
+              } else if (current === undefined && cmd.oldOid !== ZERO_OID) {
+                report.push({ ref: cmd.ref, ok: false, reason: 'old value does not match' });
+              } else if (target === undefined) {
+                report.push({ ref: cmd.ref, ok: false, reason: 'object not found' });
+              } else if (cmd.ref.startsWith('refs/heads/') && target.type !== 'commit') {
+                report.push({ ref: cmd.ref, ok: false, reason: 'object is not a commit' });
+              } else if (cmd.oldOid !== ZERO_OID && current !== undefined && !isAncestor(rec, current, cmd.newOid)) {
+                report.push({ ref: cmd.ref, ok: false, reason: 'non-fast-forward' });
+              } else {
+                rec.refs.set(cmd.ref, cmd.newOid);
+                advanced.push(cmd.newOid);
+                report.push({ ref: cmd.ref, ok: true, reason: '' });
+              }
+            }
+            registerCommits(rec, advanced);
+          } else {
+            for (const cmd of commands) {
+              report.push({ ref: cmd.ref, ok: false, reason: 'unpack failed' });
+            }
+          }
+          sendRaw(res, 200, buildPushReport(unpackOk, unpackDetail, report), RECEIVE_RESULT);
+          return;
+        } catch {
+          sendJson(res, 400, { message: 'Invalid git request' });
+          return;
+        }
+      }
+
       // Git smart HTTP: /{owner}/{repo}.git/info/refs?service=git-upload-pack (or receive-pack).
       if (seg.length === 4 && seg[1].endsWith('.git') && seg[2] === 'info' && seg[3] === 'refs') {
         if (method !== 'GET') {
@@ -822,13 +1105,14 @@ export function createApp(): Server {
         const rec = loadRepo(res, owner, repoName);
         if (rec === null) return;
         const service = queryOf(req).get('service') ?? '';
+        const headTarget = `refs/heads/${rec.defaultBranch}`;
         if (service === 'git-upload-pack') {
           const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
-          sendRaw(res, 200, v2 ? advertiseV2UploadPack() : advertiseV0UploadPack(), UPLOAD_AD);
+          sendRaw(res, 200, v2 ? advertiseV2UploadPack() : advertiseV0UploadPack(refList(rec), headTarget), UPLOAD_AD);
           return;
         }
         if (service === 'git-receive-pack') {
-          sendRaw(res, 200, advertiseV0ReceivePack(), RECEIVE_AD);
+          sendRaw(res, 200, advertiseV0ReceivePack(refList(rec), headTarget), RECEIVE_AD);
           return;
         }
         sendJson(res, 400, { message: 'Unknown service' });

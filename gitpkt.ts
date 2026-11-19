@@ -14,6 +14,13 @@ export function pktLine(text: string): Buffer {
   return Buffer.concat([Buffer.from(head, 'ascii'), payload]);
 }
 
+/** One pkt-line carrying raw `payload` bytes (binary-safe: pack data, side-band frames). */
+export function pktLineBytes(payload: Buffer): Buffer {
+  const size = payload.length + 4;
+  const head = size.toString(16).padStart(4, '0');
+  return Buffer.concat([Buffer.from(head, 'ascii'), payload]);
+}
+
 /** The flush packet: four ASCII zeroes. */
 export function pktFlush(): Buffer {
   return Buffer.from('0000', 'ascii');
@@ -40,13 +47,37 @@ export function advertiseV2UploadPack(): Buffer {
   return Buffer.concat([pktLine('version 2\n'), ...caps.map((c) => pktLine(`${c}\n`)), pktFlush()]);
 }
 
+/** One ref as the smart-HTTP advertisements list it; `peeled` is the commit an annotated tag points at. */
+export interface AdvertisedRef {
+  oid: string;
+  name: string;
+  peeled?: string;
+}
+
+function v0Advertisement(service: string, caps: string, refs: AdvertisedRef[], headTarget: string): Buffer {
+  const lines: Buffer[] = [serviceLine(service), pktFlush()];
+  if (refs.length === 0) {
+    // An empty repository has no refs to list, so the capabilities ride on the zero id's line.
+    lines.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+  } else {
+    const head = refs.find((ref) => ref.name === headTarget);
+    const headOid = head?.oid ?? ZERO_OID;
+    lines.push(pktLine(`${headOid} HEAD\0${caps}\n`));
+    for (const ref of refs) lines.push(pktLine(`${ref.oid} ${ref.name}\n`));
+    for (const ref of refs) {
+      if (ref.peeled !== undefined) lines.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
+    }
+  }
+  lines.push(pktFlush());
+  return Buffer.concat(lines);
+}
+
 /**
- * The v0 upload-pack advertisement of an empty repository: the service line, a
- * flush, then the zero object id carrying the capabilities. An empty repository
- * has no refs to list, so the capabilities ride on the zero id's line.
+ * The v0 upload-pack advertisement: service line, flush, then the refs with the
+ * capabilities on the HEAD line (or on the zero id's line for an empty repo).
  * side-band-64k is mandatory: without it the client cannot frame the pack.
  */
-export function advertiseV0UploadPack(): Buffer {
+export function advertiseV0UploadPack(refs: AdvertisedRef[], headTarget: string): Buffer {
   const caps = [
     'multi_ack',
     'thin-pack',
@@ -64,17 +95,17 @@ export function advertiseV0UploadPack(): Buffer {
     'allow-reachable-sha1-in-want',
     'no-done',
     'filter',
+    `symref=HEAD:${headTarget}`,
     `agent=${AGENT}`,
   ].join(' ');
-  const capLine = pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`);
-  return Buffer.concat([serviceLine('git-upload-pack'), pktFlush(), capLine, pktFlush()]);
+  return v0Advertisement('git-upload-pack', caps, refs, headTarget);
 }
 
 /**
- * The v0 receive-pack advertisement of an empty repository. The rules require
- * report-status, side-band-64k and delete-refs to be advertised.
+ * The v0 receive-pack advertisement. The rules require report-status,
+ * side-band-64k and delete-refs to be advertised.
  */
-export function advertiseV0ReceivePack(): Buffer {
+export function advertiseV0ReceivePack(refs: AdvertisedRef[], headTarget: string): Buffer {
   const caps = [
     'report-status',
     'report-status-v2',
@@ -83,8 +114,8 @@ export function advertiseV0ReceivePack(): Buffer {
     'quiet',
     'atomic',
     'ofs-delta',
+    `symref=HEAD:${headTarget}`,
     `agent=${AGENT}`,
   ].join(' ');
-  const capLine = pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`);
-  return Buffer.concat([serviceLine('git-receive-pack'), pktFlush(), capLine, pktFlush()]);
+  return v0Advertisement('git-receive-pack', caps, refs, headTarget);
 }
