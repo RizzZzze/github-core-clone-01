@@ -33,3 +33,8 @@ ephemeral port, registers it, long-polls `/done`, and exits 0 when told.
   resolution and written delta-free; pushed commits are visible to the REST
   layer through the same store. Verified with a real git client (push, clone,
   byte-identical files and shas) as well as the kit suite: git 30/30.
+- Milestone 4: labels, issues (+ comments) and pull requests (+ merge) over the
+  same store. Merge is a real two-parent merge commit from a three-way file
+  merge — clean when only one side changed a path, 405 on a genuine conflict —
+  and the base branch advances to it. Kit suite: issues 15/15, pulls 20/20,
+  protocol 5/5.

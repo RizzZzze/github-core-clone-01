@@ -159,6 +159,64 @@ export interface ParsedCommit {
   message: string;
 }
 
+/**
+ * The merge base of two commits: the nearest common ancestor, found by walking
+ * both histories. `parentsOf` reads parents from the store. Null when the
+ * histories share nothing.
+ */
+export function findMergeBase(
+  parentsOf: (sha: string) => readonly string[] | undefined,
+  ours: string,
+  theirs: string,
+): string | null {
+  const oursAncestors = new Set<string>();
+  const queue: string[] = [ours];
+  while (queue.length > 0) {
+    const cur = queue.shift() as string;
+    if (oursAncestors.has(cur)) continue;
+    oursAncestors.add(cur);
+    for (const parent of parentsOf(cur) ?? []) queue.push(parent);
+  }
+  const pending: string[] = [theirs];
+  const seen = new Set<string>();
+  while (pending.length > 0) {
+    const cur = pending.shift() as string;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    if (oursAncestors.has(cur)) return cur;
+    for (const parent of parentsOf(cur) ?? []) pending.push(parent);
+  }
+  return null;
+}
+
+/** One side of a three-way file merge: path -> blob sha. */
+export type FileMap = ReadonlyMap<string, string>;
+
+/**
+ * Three-way merge of file maps (base, ours, theirs). A path both sides changed
+ * differently — including delete-against-modify — is a conflict and the whole
+ * merge is null. Equal changes, one-sided changes and clean deletions merge.
+ */
+export function threeWayMerge(base: FileMap, ours: FileMap, theirs: FileMap): Map<string, string> | null {
+  const out = new Map<string, string>();
+  const paths = new Set([...base.keys(), ...ours.keys(), ...theirs.keys()]);
+  for (const path of paths) {
+    const b = base.get(path);
+    const o = ours.get(path);
+    const t = theirs.get(path);
+    if (o === t) {
+      if (o !== undefined) out.set(path, o);
+    } else if (o === b) {
+      if (t !== undefined) out.set(path, t);
+    } else if (t === b) {
+      if (o !== undefined) out.set(path, o);
+    } else {
+      return null;
+    }
+  }
+  return out;
+}
+
 /** Parse a commit object's payload: tree, parents and the verbatim message. */
 export function parseCommit(payload: Buffer): ParsedCommit | null {
   const text = payload.toString('utf8');

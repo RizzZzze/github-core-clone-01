@@ -28,6 +28,47 @@ export interface CommitMeta {
   seq: number;
 }
 
+export interface LabelRecord {
+  name: string;
+  color: string;
+  description: string;
+}
+
+export interface IssueComment {
+  id: number;
+  body: string;
+  createdAt: string;
+}
+
+export interface IssueRecord {
+  id: number;
+  number: number;
+  title: string;
+  body: string;
+  state: 'open' | 'closed';
+  /** Label names, in the order they were attached. */
+  labels: string[];
+  comments: IssueComment[];
+  seq: number;
+}
+
+export interface PullRecord {
+  id: number;
+  number: number;
+  title: string;
+  body: string;
+  state: 'open' | 'closed';
+  head: string;
+  base: string;
+  /** Branch tips at creation time; the pull request keeps them as its record. */
+  headSha: string;
+  baseSha: string;
+  merged: boolean;
+  mergedAt: string | null;
+  mergeCommitSha: string | null;
+  seq: number;
+}
+
 export interface RepoRecord {
   id: number;
   name: string;
@@ -43,6 +84,13 @@ export interface RepoRecord {
   /** Commits by sha, in creation order for listing. */
   commits: Map<string, CommitMeta>;
   commitSeq: number;
+  /** Labels by name, issues and pulls by number — all per repository. */
+  labels: Map<string, LabelRecord>;
+  issues: Map<number, IssueRecord>;
+  issueSeq: number;
+  commentSeq: number;
+  pulls: Map<number, PullRecord>;
+  pullSeq: number;
 }
 
 export class RepoStore {
@@ -64,6 +112,12 @@ export class RepoStore {
       refs: new Map(),
       commits: new Map(),
       commitSeq: 0,
+      labels: new Map(),
+      issues: new Map(),
+      issueSeq: 0,
+      commentSeq: 0,
+      pulls: new Map(),
+      pullSeq: 0,
     };
     this.#byName.set(input.name, rec);
     return rec;
