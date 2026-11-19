@@ -36,8 +36,10 @@ import {
   parseCommit,
   parseTree,
   splitObject,
-  threeWayMerge,
 } from './gitobj.ts';
+import { performMerge } from './merge.ts';
+import { createGraphqlHandler } from './graphql.ts';
+import { createMcpHandler } from './mcp.ts';
 import {
   ZERO_OID,
   collectReachable,
@@ -158,6 +160,8 @@ function validRepoName(name: unknown): name is string {
 
 export function createApp(): Server {
   const store = new RepoStore();
+  const graphqlHandler = createGraphqlHandler({ store, merge: performMerge });
+  const mcpHandler = createMcpHandler({ store });
   let requestSeq = 0;
   const token = expectedToken();
 
@@ -353,32 +357,6 @@ export function createApp(): Server {
     const meta: CommitMeta = { sha, treeSha, parents, message, seq: rec.commitSeq++ };
     rec.commits.set(sha, meta);
     rec.refs.set(`refs/heads/${branch}`, sha);
-    return meta;
-  };
-
-  /**
-   * Mint a two-parent merge commit on `baseBranch` from a merged file map and
-   * move the base ref to it. The first parent is the old base tip, the second
-   * the head tip — a real merge commit, not a squash.
-   */
-  const mintMergeCommit = (
-    rec: RepoRecord,
-    baseBranch: string,
-    headTip: string,
-    files: ReadonlyMap<string, string>,
-    message: string,
-  ): CommitMeta => {
-    const put = (sha: string, bytes: Buffer): void => {
-      if (!rec.objects.has(sha)) rec.objects.set(sha, bytes);
-    };
-    const treeSha = buildTreesForFiles(files, put);
-    const baseTip = branchTip(rec, baseBranch);
-    const parents = baseTip === null ? [headTip] : [baseTip, headTip];
-    const { sha, bytes } = buildCommit({ treeSha, parents, message });
-    put(sha, bytes);
-    const meta: CommitMeta = { sha, treeSha, parents, message, seq: rec.commitSeq++ };
-    rec.commits.set(sha, meta);
-    rec.refs.set(`refs/heads/${baseBranch}`, sha);
     return meta;
   };
 
@@ -657,6 +635,39 @@ export function createApp(): Server {
         return;
       }
 
+      // GraphQL v4: POST /api/graphql, one operation or a batched array. A
+      // GraphQL-level failure is a 200 with an errors array, never an HTTP
+      // error; an unauthenticated request is a 401.
+      if (method === 'POST' && path === '/api/graphql') {
+        if (!authed(req)) {
+          unauthorised(res);
+          return;
+        }
+        const parsed = parseJson(await readBody(req));
+        if (!parsed.ok) {
+          badJson(res);
+          return;
+        }
+        sendJson(res, 200, graphqlHandler(parsed.value));
+        return;
+      }
+
+      // MCP: POST /mcp, JSON-RPC 2.0 Streamable HTTP. Auth is decided before
+      // any method exists, so a call with no Authorization is a 401.
+      if (method === 'POST' && path === '/mcp') {
+        if (!authed(req)) {
+          unauthorised(res);
+          return;
+        }
+        const outcome = mcpHandler(await readBody(req), originOf(req));
+        if (outcome.body === null) {
+          sendEmpty(res, outcome.status);
+          return;
+        }
+        sendJson(res, outcome.status, outcome.body);
+        return;
+      }
+
       // Everything under /api/v3 past the root, and every git path, needs the token.
       if (seg[0] === 'api' && seg[1] === 'v3') {
         if (!authed(req)) {
@@ -665,6 +676,18 @@ export function createApp(): Server {
         }
         if (method === 'GET' && seg.length === 3 && seg[2] === 'meta') {
           sendJson(res, 200, { installed_version: '1.0.0' });
+          return;
+        }
+        if (method === 'GET' && seg.length === 3 && seg[2] === 'user') {
+          sendJson(res, 200, {
+            login: VIEWER_LOGIN,
+            id: 1000,
+            node_id: 'U_1000',
+            type: 'User',
+            name: 'adaiversen',
+            html_url: `${originOf(req)}/adaiversen`,
+            url: `${originOf(req)}/api/v3/users/adaiversen`,
+          });
           return;
         }
         if (seg.length >= 3 && seg[2] === 'user' && seg[3] === 'repos') {
@@ -1402,44 +1425,23 @@ export function createApp(): Server {
               return;
             }
             // The merge body carries merge_method; any method merges the same way:
-            // a two-parent merge commit. A malformed body does not block the merge.
+            // a two-parent merge commit (shared performMerge, also used by the
+            // GraphQL and MCP surfaces). A malformed body does not block the merge.
             await readBody(req);
             if (pull.state !== 'open') {
               sendJson(res, 405, { message: 'Pull request is already closed' });
               return;
             }
-            const headTip = branchTip(rec, pull.head);
-            const baseTip = branchTip(rec, pull.base);
-            if (headTip === null || baseTip === null) {
-              notFound(res);
+            const outcome = performMerge(rec, pull);
+            if (!outcome.ok) {
+              if (outcome.message === 'Branch not found') {
+                notFound(res);
+                return;
+              }
+              sendJson(res, 405, { message: outcome.message });
               return;
             }
-            if (isAncestor(rec, headTip, baseTip)) {
-              sendJson(res, 405, { message: 'Nothing to merge' });
-              return;
-            }
-            const parentsOf = (sha: string): readonly string[] | undefined => rec.commits.get(sha)?.parents;
-            const mergeBase = findMergeBase(parentsOf, baseTip, headTip);
-            if (mergeBase === null) {
-              sendJson(res, 405, { message: 'No common ancestor' });
-              return;
-            }
-            const treeOf = (sha: string): Map<string, string> => {
-              const meta = rec.commits.get(sha);
-              return meta === undefined ? new Map() : filesOfTree(meta.treeSha, (s) => rec.objects.get(s));
-            };
-            const merged = threeWayMerge(treeOf(mergeBase), treeOf(baseTip), treeOf(headTip));
-            if (merged === null) {
-              sendJson(res, 405, { message: 'Merge conflict' });
-              return;
-            }
-            const message = `Merge pull request #${pull.number} from ${rec.ownerLogin}/${pull.head}`;
-            const meta = mintMergeCommit(rec, pull.base, headTip, merged, message);
-            pull.state = 'closed';
-            pull.merged = true;
-            pull.mergedAt = FIXED_TIME;
-            pull.mergeCommitSha = meta.sha;
-            sendJson(res, 200, { sha: meta.sha, merged: true, message: meta.message });
+            sendJson(res, 200, { sha: outcome.sha, merged: true, message: outcome.message });
             return;
           }
           notFound(res);

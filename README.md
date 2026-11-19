@@ -38,3 +38,10 @@ ephemeral port, registers it, long-polls `/done`, and exits 0 when told.
   merge — clean when only one side changed a path, 405 on a genuine conflict —
   and the base branch advances to it. Kit suite: issues 15/15, pulls 20/20,
   protocol 5/5.
+- Milestone 5: GraphQL v4 at POST /api/graphql (a dependency-free parser and
+  executor: viewer, repository with issues/pullRequests and cursor pagination,
+  node(id:), __type introspection, all five mutations, operation batching) and
+  MCP at POST /mcp (JSON-RPC 2.0, server/discover for the 2026-07-28 era plus
+  the legacy initialize handshake, six tools over the same store). The merge
+  implementation is shared by REST, GraphQL and MCP, so the three surfaces
+  can never disagree. Kit suite: 120/120, feature 600, agent 200.
